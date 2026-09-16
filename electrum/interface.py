@@ -618,14 +618,22 @@ class Interface(Logger):
             res = await self.session.send_request('blockchain.block.headers', [index * 2016, size, cp_height])
         finally:
             self._requested_chunks.discard(index)
-        # assert_dict_contains_field(res, field_name='count')
-        # assert_dict_contains_field(res, field_name='hex')
-        # assert_dict_contains_field(res, field_name='max')
-        # assert_non_negative_integer(res['count'])
-        # assert_non_negative_integer(res['max'])
-        # assert_hex_str(res['hex'])
-        # if len(res['hex']) != HEADER_SIZE * 2 * res['count']:
-        #     raise RequestCorrupted('inconsistent chunk hex and count')
+        assert_dict_contains_field(res, field_name='count')
+        assert_dict_contains_field(res, field_name='hex')
+        assert_dict_contains_field(res, field_name='max')
+        assert_non_negative_integer(res['count'])
+        assert_non_negative_integer(res['max'])
+        assert_hex_str(res['hex'])
+        # Calculate Bitcoin-expected size
+        expected_hex_size = HEADER_SIZE * 2 * res['count']
+        # AuxPoW headers will cause the hex size to exceed the Bitcoin-expected
+        # size by an unpredictable amount.
+        if len(res['hex']) < expected_hex_size:
+            raise RequestCorrupted('inconsistent chunk hex and count (AuxPoW)')
+        # If this chunk is covered by a checkpoint, then AuxPoW is stripped,
+        # thus we should exactly match the Bitcoin-expected size.
+        if cp_height != 0 and len(res['hex']) != expected_hex_size:
+            raise RequestCorrupted('inconsistent chunk hex and count (non-AuxPoW)')
         # we never request more than 2016 headers, but we enforce those fit in a single response
         if res['max'] < 2016:
             raise RequestCorrupted(f"server uses too low 'max' count for block.headers: {res['max']} < 2016")

@@ -23,7 +23,7 @@
 import os
 import threading
 import time
-from typing import Optional, Dict, Mapping, Sequence
+from typing import Optional, Dict, Mapping, Sequence, Callable, Tuple
 
 from . import util
 from .bitcoin import hash_encode, int_to_hex, rev_hex
@@ -38,7 +38,8 @@ from . import auxpow
 _logger = get_logger(__name__)
 
 HEADER_SIZE = 80  # bytes
-MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+UINT256_MASK = (1 << 256) - 1
+MEDIAN_TIME_SPAN = 11  # CBlockIndex::nMedianTimeSpan in Doichain Core
 
 
 class MissingHeader(Exception):
@@ -107,6 +108,152 @@ def hash_raw_header(header: str) -> str:
     return hash_encode(sha256d(bfh(header)))
 
 
+# Doichain's difficulty rules, as Doichain Core implements them (src/pow.cpp):
+# up to DIGISHIELD_HEIGHT - 1 a retarget every 2016 blocks, from DIGISHIELD_HEIGHT
+# on DigiShield-v3 per block, with a one-time reset window and a bounded
+# emergency valve. Core computes with arith_uint256, so multiplications below
+# wrap modulo 2**256 and divisions truncate, exactly as there.
+
+def compact_to_target(bits: int) -> Tuple[int, bool, bool]:
+    """arith_uint256::SetCompact. Returns (target, negative, overflow)."""
+    size = bits >> 24
+    word = bits & 0x007fffff
+    if size <= 3:
+        target = word >> (8 * (3 - size))
+    else:
+        target = (word << (8 * (size - 3))) & UINT256_MASK
+    negative = word != 0 and (bits & 0x00800000) != 0
+    overflow = word != 0 and (size > 34 or (word > 0xff and size > 33) or (word > 0xffff and size > 32))
+    return target, negative, overflow
+
+
+def target_to_compact(target: int) -> int:
+    """arith_uint256::GetCompact for a non-negative target."""
+    size = (target.bit_length() + 7) // 8
+    if size <= 3:
+        compact = target << (8 * (3 - size))
+    else:
+        compact = target >> (8 * (size - 3))
+    if compact & 0x00800000:
+        compact >>= 8
+        size += 1
+    return compact | (size << 24)
+
+
+def derive_target(bits: int) -> Optional[int]:
+    """Doichain Core's DeriveTarget: the target bits encodes, or None if it is
+    negative, zero, overflowing or easier than powLimit."""
+    target, negative, overflow = compact_to_target(bits)
+    if negative or overflow or target == 0 or target > constants.net.POW_LIMIT:
+        return None
+    return target
+
+
+def _div_trunc(a: int, b: int) -> int:
+    """C++ integer division, which truncates towards zero."""
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+def _median_time_past(height: int, read_header: Callable[[int], dict]) -> int:
+    """CBlockIndex::GetMedianTimePast of the block at height."""
+    first = max(0, height - MEDIAN_TIME_SPAN + 1)
+    times = sorted(read_header(h)['timestamp'] for h in range(first, height + 1))
+    return times[len(times) // 2]
+
+
+def get_next_work_required(header: dict, read_header: Callable[[int], dict]) -> int:
+    """The nBits Doichain Core's GetNextWorkRequired demands for header.
+    read_header(h) must return the header at every height h below it."""
+    net = constants.net
+    height = header['block_height']
+    prev = read_header(height - 1)
+    if height >= net.DIGISHIELD_HEIGHT:
+        return _get_next_work_required_digishield(header, prev, read_header)
+    if height % 2016 != 0:
+        return prev['bits']
+    # Namecoin's retarget spans a full 2016 intervals, except at the first boundary.
+    blocks_back = 2016 if (height - 1 >= net.AUXPOW_START_HEIGHT and height > 2016) else 2015
+    first = read_header(height - 1 - blocks_back)
+    timespan = prev['timestamp'] - first['timestamp']
+    timespan = max(timespan, net.POW_TARGET_TIMESPAN // 4)
+    timespan = min(timespan, net.POW_TARGET_TIMESPAN * 4)
+    target, _, _ = compact_to_target(prev['bits'])
+    # Close to Doichain's easy powLimit this product exceeds 256 bits. That
+    # happened at the first retarget (height 2016), and the chain carries the
+    # wrapped value, so the overflow is part of the rule.
+    target = (target * timespan) & UINT256_MASK
+    target //= net.POW_TARGET_TIMESPAN
+    return target_to_compact(min(target, net.POW_LIMIT))
+
+
+def _get_next_work_required_digishield(header: dict, prev: dict,
+                                       read_header: Callable[[int], dict]) -> int:
+    net = constants.net
+    height = header['block_height']
+    window = net.DIGISHIELD_AVERAGING_WINDOW
+    if net.DIGISHIELD_RESET_BITS and height < net.DIGISHIELD_HEIGHT + window + MEDIAN_TIME_SPAN:
+        # one-time reset window after activation
+        target, _, _ = compact_to_target(net.DIGISHIELD_RESET_BITS)
+    else:
+        first_height = height - 1 - window
+        if first_height < 0:
+            return target_to_compact(net.POW_LIMIT)
+        total = 0
+        for h in range(height - window, height):
+            total += compact_to_target(read_header(h)['bits'])[0]
+        window_timespan = window * net.POW_TARGET_SPACING
+        timespan = _median_time_past(height - 1, read_header) - _median_time_past(first_height, read_header)
+        timespan = window_timespan + _div_trunc(timespan - window_timespan, 4)
+        timespan = max(timespan, window_timespan * (100 - net.DIGISHIELD_MAX_ADJUST_UP) // 100)
+        timespan = min(timespan, window_timespan * (100 + net.DIGISHIELD_MAX_ADJUST_DOWN) // 100)
+        target = total // window // window_timespan
+        target = min((target * timespan) & UINT256_MASK, net.POW_LIMIT)
+        target, _, _ = compact_to_target(target_to_compact(target))
+    # emergency valve: a block more than MIN_DIFFICULTY_GAP seconds after its
+    # parent may be MIN_DIFFICULTY_VALVE_FACTOR times easier
+    if (net.MIN_DIFFICULTY_GAP > 0 and net.MIN_DIFFICULTY_VALVE_FACTOR > 1
+            and header['timestamp'] > prev['timestamp'] + net.MIN_DIFFICULTY_GAP):
+        target = (target * net.MIN_DIFFICULTY_VALVE_FACTOR) & UINT256_MASK
+    return target_to_compact(min(target, net.POW_LIMIT))
+
+
+# net -> {height: header}
+_CHECKPOINT_TAIL_HEADERS = {}  # type: Dict[type, Dict[int, dict]]
+
+
+def _load_checkpoint_tail_headers(net) -> Dict[int, dict]:
+    tail = net.CHECKPOINT_TAIL_HEADERS
+    if not tail or not net.CHECKPOINTS:
+        return {}
+    headers = {}
+    height = tail['height']
+    prev_hash = None
+    for raw in tail['headers']:
+        header = deserialize_pure_header(bfh(raw), height)
+        if prev_hash is not None and header['prev_block_hash'] != prev_hash:
+            _logger.error("checkpoint tail headers do not chain up; ignoring them")
+            return {}
+        headers[height] = header
+        prev_hash = hash_header(header)
+        height += 1
+    if height - 1 != net.max_checkpoint() or prev_hash != net.CHECKPOINTS[-1][0]:
+        _logger.error("checkpoint tail headers do not end at the last checkpoint; ignoring them")
+        return {}
+    return headers
+
+
+def checkpoint_tail_headers() -> Dict[int, dict]:
+    """The headers just below the last checkpoint that ship with the release,
+    by height. The difficulty rules of the first headers after the checkpoint
+    look back at them, while headers below the checkpoint are only downloaded
+    on demand. Empty unless they chain up to the checkpoint hash."""
+    net = constants.net
+    if net not in _CHECKPOINT_TAIL_HEADERS:
+        _CHECKPOINT_TAIL_HEADERS[net] = _load_checkpoint_tail_headers(net)
+    return _CHECKPOINT_TAIL_HEADERS[net]
+
+
 # key: blockhash hex at forkpoint
 # the chain at some key is the best chain that includes the given hash
 blockchains = {}  # type: Dict[str, Blockchain]
@@ -123,7 +270,8 @@ def read_blockchains(config: 'SimpleConfig'):
     # consistency checks
     if best_chain.height() > constants.net.max_checkpoint():
         header_after_cp = best_chain.read_header(constants.net.max_checkpoint()+1)
-        if not header_after_cp or not best_chain.can_connect(header_after_cp, check_height=False, skip_auxpow=False):
+        # headers on disk are stored without their AuxPoW, so it cannot be checked here
+        if not header_after_cp or not best_chain.can_connect(header_after_cp, check_height=False, skip_auxpow=True):
             _logger.info("[blockchain] deleting best chain. cannot connect header after last cp to last cp.")
             os.unlink(best_chain.path())
             best_chain.update_size()
@@ -164,7 +312,7 @@ def read_blockchains(config: 'SimpleConfig'):
         if first_hash != hash_header(h):
             delete_chain(filename, "incorrect first hash for chain")
             return
-        if not b.parent.can_connect(h, check_height=False):
+        if not b.parent.can_connect(h, check_height=False, skip_auxpow=True):
             delete_chain(filename, "cannot connect chain to parent")
             return
         chain_id = b.get_id()
@@ -315,7 +463,11 @@ class Blockchain(Logger):
         self._size = os.path.getsize(p)//HEADER_SIZE if os.path.exists(p) else 0
 
     @classmethod
-    def verify_header(cls, header: dict, prev_hash: str, target: int, expected_header_hash: str=None, skip_auxpow: bool=False) -> None:
+    def verify_header(cls, header: dict, prev_hash: str, target: Optional[int], expected_header_hash: str=None, skip_auxpow: bool=False) -> None:
+        """Raises unless header links to prev_hash, carries the bits of target
+        (skipped if target is None) and has enough proof of work for its bits.
+        Proof of work is not checked at or below the last checkpoint, where
+        the header is pinned by its hash."""
         _hash = hash_header(header)
         if expected_header_hash and expected_header_hash != _hash:
             raise Exception("hash mismatches with expected: {} vs {}".format(expected_header_hash, _hash))
@@ -323,24 +475,53 @@ class Blockchain(Logger):
             raise Exception("prev hash mismatch: %s vs %s" % (prev_hash, header.get('prev_block_hash')))
         if constants.net.TESTNET:
             return
-        bits = cls.target_to_bits(target)
-        #if bits != header.get('bits'):
-        #    raise Exception("bits mismatch: %s vs %s" % (bits, header.get('bits')))
+        bits = header.get('bits')
+        if target is not None:
+            expected_bits = target_to_compact(target)
+            if bits != expected_bits:
+                raise Exception("bits mismatch: %s vs %s" % (hex(expected_bits), hex(bits)))
         # Don't verify AuxPoW when covered by a checkpoint
         if header.get('block_height') <= constants.net.max_checkpoint():
             skip_auxpow = True
         if not skip_auxpow:
+            pow_target = derive_target(bits)
+            if pow_target is None:
+                raise Exception(f"bits out of range: {hex(bits)}")
             _pow_hash = auxpow.hash_parent_header(header)
             block_hash_as_num = int.from_bytes(bfh(_pow_hash), byteorder='big')
-            if block_hash_as_num > target:
-                raise Exception(f"insufficient proof of work: {block_hash_as_num} vs target {target}")
+            if block_hash_as_num > pow_target:
+                raise Exception(f"insufficient proof of work: {block_hash_as_num} vs target {pow_target}")
+
+    def read_header_for_rules(self, height: int, pending: Optional[Dict[int, dict]] = None) -> dict:
+        """The header at height, for the difficulty rules: from pending (headers
+        of a chunk being verified), from disk, or from the headers shipped below
+        the last checkpoint."""
+        header = pending.get(height) if pending else None
+        if header is None:
+            header = self.read_header(height)
+        if header is None:
+            header = checkpoint_tail_headers().get(height)
+        if header is None:
+            raise MissingHeader(height)
+        return header
+
+    def get_expected_target(self, header: dict, pending: Optional[Dict[int, dict]] = None) -> Optional[int]:
+        """The target Doichain Core requires for header, or None at and below the
+        last checkpoint. There every header is pinned by its hash, and headers
+        are only downloaded on demand, so their predecessors may be missing."""
+        if constants.net.TESTNET or header['block_height'] <= constants.net.max_checkpoint():
+            return None
+        bits = get_next_work_required(header, lambda h: self.read_header_for_rules(h, pending))
+        return compact_to_target(bits)[0]
 
     def verify_chunk(self, index: int, data: bytes) -> bytes:
         stripped = bytearray()
         start_position = 0
         start_height = index * 2016
         prev_hash = self.get_hash(start_height - 1)
-        target = self.get_target(index-1)
+        # the headers of this chunk verified so far; the difficulty rules of the
+        # headers after them look back at them
+        pending = {}  # type: Dict[int, dict]
         i = 0
         while start_position < len(data):
             height = start_height + i
@@ -353,7 +534,9 @@ class Blockchain(Logger):
             stripped.extend(data[start_position:start_position+HEADER_SIZE])
 
             header, start_position = deserialize_full_header(data, index*2016 + i, expect_trailing_data=True, start_position=start_position)
+            target = self.get_expected_target(header, pending)
             self.verify_header(header, prev_hash, target, expected_header_hash)
+            pending[height] = header
             prev_hash = hash_header(header)
 
             i = i + 1
@@ -551,36 +734,11 @@ class Blockchain(Logger):
                 raise MissingHeader(height)
             return hash_header(header)
 
-    def get_target(self, index: int) -> int:
-        # compute target from chunk x, used in chunk x+1
-        if constants.net.TESTNET:
-            return 0
-        if index == -1:
-            return MAX_TARGET
-        if index < len(self.checkpoints):
-            h, t = self.checkpoints[index]
-            return t
-        # new target
-        first = self.read_header(index * 2016)
-        last = self.read_header(index * 2016 + 2015)
-        if not first or not last:
-            raise MissingHeader()
-        bits = last.get('bits')
-        target = self.bits_to_target(bits)
-        nActualTimespan = last.get('timestamp') - first.get('timestamp')
-        nTargetTimespan = 14 * 24 * 60 * 60
-        nActualTimespan = max(nActualTimespan, nTargetTimespan // 4)
-        nActualTimespan = min(nActualTimespan, nTargetTimespan * 4)
-        new_target = min(MAX_TARGET, (target * nActualTimespan) // nTargetTimespan)
-        # not any target can be represented in 32 bits:
-        new_target = self.bits_to_target(self.target_to_bits(new_target))
-        return new_target
-
     @classmethod
     def bits_to_target(cls, bits: int) -> int:
         bitsN = (bits >> 24) & 0xff
         if not (0x03 <= bitsN <= 0x1f): #Doichain
-            raise Exception("First part of bits should be in [0x03, 0x1d]")
+            raise Exception("First part of bits should be in [0x03, 0x1f]")
         bitsBase = bits & 0xffffff
         if not (0x8000 <= bitsBase <= 0x7fffff):
             raise Exception("Second part of bits should be in [0x8000, 0x7fffff]")
@@ -599,10 +757,32 @@ class Blockchain(Logger):
 
     def chainwork_of_header_at_height(self, height: int) -> int:
         """work done by single header at given height"""
-        chunk_idx = height // 2016 - 1
-        target = self.get_target(chunk_idx)
+        if height <= constants.net.max_checkpoint():
+            # Below the checkpoint the target comes from the checkpoints, one per
+            # chunk. Every chain shares that part, so only consistency matters.
+            chunk_idx = height // 2016 - 1
+            if chunk_idx == -1:
+                target = compact_to_target(target_to_compact(constants.net.POW_LIMIT))[0]
+            else:
+                h, target = self.checkpoints[chunk_idx]
+        else:
+            header = self.read_header(height)
+            if header is None:
+                raise MissingHeader(height)
+            target = derive_target(header['bits'])
+            if target is None:
+                raise Exception(f"bits out of range at height {height}")
         work = ((2 ** 256 - target - 1) // (target + 1)) + 1
         return work
+
+    def _chainwork_of_range(self, first: int, last: int) -> int:
+        """work done by the headers first..last, which lie in one chunk"""
+        if last < first:
+            return 0
+        if last <= constants.net.max_checkpoint():
+            return (last - first + 1) * self.chainwork_of_header_at_height(last)
+        # above the checkpoint the difficulty changes with every block
+        return sum(self.chainwork_of_header_at_height(h) for h in range(first, last + 1))
 
     @with_lock
     def get_chainwork(self, height=None) -> int:
@@ -622,14 +802,9 @@ class Blockchain(Logger):
         running_total = _CHAINWORK_CACHE[self.get_hash(cached_height)]
         while cached_height < last_retarget:
             cached_height += 2016
-            work_in_single_header = self.chainwork_of_header_at_height(cached_height)
-            work_in_chunk = 2016 * work_in_single_header
-            running_total += work_in_chunk
+            running_total += self._chainwork_of_range(cached_height - 2015, cached_height)
             _CHAINWORK_CACHE[self.get_hash(cached_height)] = running_total
-        cached_height += 2016
-        work_in_single_header = self.chainwork_of_header_at_height(cached_height)
-        work_in_last_partial_chunk = (height % 2016 + 1) * work_in_single_header
-        return running_total + work_in_last_partial_chunk
+        return running_total + self._chainwork_of_range(last_retarget + 1, height)
 
     def can_connect(self, header: dict, check_height: bool=True, skip_auxpow: bool=False) -> bool:
         if header is None:
@@ -646,13 +821,13 @@ class Blockchain(Logger):
         if prev_hash != header.get('prev_block_hash'):
             return False
         try:
-            target = self.get_target(height // 2016 - 1)
+            target = self.get_expected_target(header)
         except MissingHeader:
             return False
-        #try:
-        #    self.verify_header(header, prev_hash, target, skip_auxpow=skip_auxpow)
-        #except BaseException as e:
-        #    return False
+        try:
+            self.verify_header(header, prev_hash, target, skip_auxpow=skip_auxpow)
+        except BaseException as e:
+            return False
         return True
 
     def connect_chunk(self, idx: int, hexdata: str) -> bool:
@@ -668,13 +843,16 @@ class Blockchain(Logger):
             return False
 
     def get_checkpoints(self):
-        # for each chunk, store the hash of the last block and the target after the chunk
+        # for each chunk, store the hash of the last block and the target of the
+        # block after it (the target the next chunk starts with)
         cp = []
         n = self.height() // 2016
         for index in range(n):
             h = self.get_hash((index+1) * 2016 -1)
-            target = self.get_target(index)
-            cp.append((h, target))
+            header = self.read_header((index+1) * 2016)
+            if header is None:
+                break
+            cp.append((h, compact_to_target(header['bits'])[0]))
         return cp
 
 
