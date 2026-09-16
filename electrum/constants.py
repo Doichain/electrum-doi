@@ -48,6 +48,10 @@ BIP39_WALLET_FORMATS = read_json('bip39_wallet_formats.json', [])
 class AbstractNet:
 
     BLOCK_HEIGHT_FIRST_LIGHTNING_CHANNELS = 0
+    # headers just below the last checkpoint, see blockchain.checkpoint_tail_headers
+    CHECKPOINT_TAIL_HEADERS = {}
+    # Core's fStrictChainId: reject an AuxPoW parent block that carries our chain ID
+    AUXPOW_STRICT_CHAIN_ID = False
 
     @classmethod
     def max_checkpoint(cls) -> int:
@@ -61,7 +65,7 @@ class AbstractNet:
 class BitcoinMainnet(AbstractNet):
 
     TESTNET = False
-    WIF_PREFIX = 180 #B4 hex 
+    WIF_PREFIX = 180 #B4 hex
     ADDRTYPE_P2PKH = 52 #34 hex
     ADDRTYPE_P2SH = 13 #D hex
     SEGWIT_HRP = "dc"
@@ -69,7 +73,21 @@ class BitcoinMainnet(AbstractNet):
     DEFAULT_PORTS = {'t': '50001', 's': '50002'}
     DEFAULT_SERVERS = read_json('servers.json', {})
     CHECKPOINTS = read_json('checkpoints.json', [])
+    CHECKPOINT_TAIL_HEADERS = read_json('checkpoint_tail_headers.json', {})
     #BLOCK_HEIGHT_FIRST_LIGHTNING_CHANNELS = 497000
+
+    # Difficulty rules as in Doichain Core (src/pow.cpp, src/consensus/params.h,
+    # src/kernel/chainparams.cpp); see blockchain.get_next_work_required.
+    POW_LIMIT = 0x0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    POW_TARGET_TIMESPAN = 14 * 24 * 60 * 60
+    POW_TARGET_SPACING = 10 * 60
+    DIGISHIELD_HEIGHT = 431017
+    DIGISHIELD_AVERAGING_WINDOW = 17
+    DIGISHIELD_MAX_ADJUST_UP = 16  # percent
+    DIGISHIELD_MAX_ADJUST_DOWN = 32  # percent
+    DIGISHIELD_RESET_BITS = 0x1a0400cd
+    MIN_DIFFICULTY_GAP = 60 * 60
+    MIN_DIFFICULTY_VALVE_FACTOR = 4
 
     XPRV_HEADERS = {
         'standard':    0x0488ade4,  # xprv

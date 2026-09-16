@@ -72,6 +72,9 @@ class AuxPoWNotGenerateError(AuxPowVerifyError):
 class AuxPoWOwnChainIDError(AuxPowVerifyError):
     pass
 
+class AuxPoWParentHasAuxPoWVersionError(AuxPowVerifyError):
+    pass
+
 class AuxPoWChainMerkleTooLongError(AuxPowVerifyError):
     pass
 
@@ -128,7 +131,7 @@ def deserialize_auxpow_header(base_header, s, start_position=0) -> (dict, int):
     # Deserialize them and save the trailing data.
     auxpow_header['coinbase_merkle_branch'], auxpow_header['coinbase_merkle_index'], start_position = deserialize_merkle_branch(s, start_position=start_position)
     auxpow_header['chain_merkle_branch'], auxpow_header['chain_merkle_index'], start_position = deserialize_merkle_branch(s, start_position=start_position)
-    
+
     # Finally there's the parent header.  Deserialize it.
     parent_header_bytes = s[start_position : start_position + blockchain.HEADER_SIZE]
     auxpow_header['parent_header'] = blockchain.deserialize_pure_header(parent_header_bytes, None)
@@ -172,11 +175,14 @@ def calc_merkle_index(chain_id, nonce, merkle_size):
     rand = (rand * 1103515245 + 12345) & 0xffffffff
     return rand % merkle_size
 
-# Copied from Electrum-DOGE
+# Copied from Electrum-DOGE, aligned with Doichain Core's CheckAuxPowProofOfWork
+# (src/validation.cpp) and CAuxPow::check (src/auxpow.cpp).
 # TODO: Audit this function carefully.
 def verify_auxpow(header):
     auxhash = blockchain.hash_header(header)
     auxpow = header['auxpow']
+    # Core checks the AuxPoW against the chain ID in the block's own version.
+    chain_id = get_chain_id(header)
 
     parent_block = auxpow['parent_header']
     coinbase = auxpow['parent_coinbase_tx']
@@ -186,18 +192,20 @@ def verify_auxpow(header):
     chain_index = auxpow['chain_merkle_index']
 
     coinbase_merkle_branch = auxpow['coinbase_merkle_branch']
-    coinbase_index = auxpow['coinbase_merkle_index']
 
-    #if (coinbaseTx.nIndex != 0)
-    #    return error("AuxPow is not a generate");
+    #if (block.auxpow->getParentBlock().IsAuxpow())
+    #    return error("auxpow parent block has auxpow version");
 
-    if (coinbase_index != 0):
-        raise AuxPoWNotGenerateError("AuxPow is not a generate")
+    if parent_block['version'] & BLOCK_VERSION_AUXPOW_BIT:
+        raise AuxPoWParentHasAuxPoWVersionError("auxpow parent block has auxpow version")
 
-    #if (get_chain_id(parent_block) == chain_id)
+    # Core serializes the coinbase index (nIndex) but ignores it: the coinbase
+    # is always checked at index 0 of the parent block (see below).
+
+    #if (params.fStrictChainId && parentBlock.GetChainId () == nChainId)
     #  return error("Aux POW parent has our chain ID");
 
-    if (get_chain_id(parent_block) == constants.net.AUXPOW_CHAIN_ID):
+    if constants.net.AUXPOW_STRICT_CHAIN_ID and get_chain_id(parent_block) == chain_id:
         raise AuxPoWOwnChainIDError("Aux POW parent has our chain ID")
 
     #if (vChainMerkleBranch.size() > 30)
@@ -215,9 +223,9 @@ def verify_auxpow(header):
     root_hash_bytes = bfh(hash_merkle_root(chain_merkle_branch, auxhash, chain_index))
 
     # Check that we are in the parent block merkle tree
-    # if (CBlock::CheckMerkleBranch(GetHash(), vMerkleBranch, nIndex) != parentBlock.hashMerkleRoot)
+    # if (CheckMerkleBranch(coinbaseTx->GetHash(), vMerkleBranch, 0) != parentBlock.hashMerkleRoot)
     #    return error("Aux POW merkle root incorrect");
-    if (hash_merkle_root(coinbase_merkle_branch, coinbase_hash, coinbase_index) != parent_block['merkle_root']):
+    if (hash_merkle_root(coinbase_merkle_branch, coinbase_hash, 0) != parent_block['merkle_root']):
         raise AuxPoWBadCoinbaseMerkleBranchError("Aux POW merkle root incorrect")
 
     #// Check that there is at least one input.
@@ -340,7 +348,7 @@ def verify_auxpow(header):
     #if (nChainIndex != (rand % nSize))
         #return error("Aux POW wrong index");
 
-    index = calc_merkle_index(constants.net.AUXPOW_CHAIN_ID, nonce, size)
+    index = calc_merkle_index(chain_id, nonce, size)
     #print 'index', index
 
     if (chain_index != index):

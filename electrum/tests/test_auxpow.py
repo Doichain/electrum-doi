@@ -72,7 +72,7 @@ class Test_auxpow(SequentialTestCase):
         header = self.deserialize_with_auxpow(namecoin_header_37174)
         header_auxpow = header['auxpow']
 
-        self.assertEqual(constants.net.AUXPOW_CHAIN_ID, header_auxpow['chain_id'])
+        self.assertEqual(1, header_auxpow['chain_id'])  # Namecoin's chain ID
 
         coinbase_tx = header_auxpow['parent_coinbase_tx']
         expected_coinbase_txid = '8a3164be45a621f85318647d425fe9f45837b8e42ec4fdd902d7f64daf61ff4a'
@@ -138,18 +138,19 @@ class Test_auxpow(SequentialTestCase):
         header = self.deserialize_with_auxpow(header_zero_output_auxpow)
         blockchain.Blockchain.verify_header(header, prev_hash_zero_output_auxpow, target_zero_output_auxpow)
 
-    # Check that a non-generate AuxPoW transaction is rejected.
-    # Equivalent to shouldRejectNonGenerateAuxPoW in libdohj tests.
-    def test_should_reject_non_generate_auxpow(self):
+    # Doichain Core serializes the coinbase index (nIndex) but ignores it and
+    # always checks the coinbase at index 0, so a non-zero value is accepted.
+    # (libdohj's shouldRejectNonGenerateAuxPoW describes the old rule.)
+    def test_non_generate_index_is_ignored(self):
         header = self.deserialize_with_auxpow(namecoin_header_37174)
         header['auxpow']['coinbase_merkle_index'] = 0x01
 
-        with self.assertRaises(auxpow.AuxPoWNotGenerateError):
-            blockchain.Blockchain.verify_header(header, namecoin_prev_hash_37174, namecoin_target_37174)
+        blockchain.Blockchain.verify_header(header, namecoin_prev_hash_37174, namecoin_target_37174)
 
     # Check that block headers from the sidechain are rejected as parent chain
     # for AuxPoW, via checking of the chain ID's.
-    # Equivalent to shouldRejectOwnChainID in libdohj tests.
+    # Equivalent to shouldRejectOwnChainID in libdohj tests. Doichain Core only
+    # applies it with fStrictChainId, which Doichain leaves off.
     def test_should_reject_own_chain_id(self):
         parent_header = self.deserialize_with_auxpow(namecoin_header_19204)
         self.assertEqual(1, auxpow.get_chain_id(parent_header))
@@ -157,7 +158,25 @@ class Test_auxpow(SequentialTestCase):
         header = self.deserialize_with_auxpow(namecoin_header_37174)
         header['auxpow']['parent_header'] = parent_header
 
-        with self.assertRaises(auxpow.AuxPoWOwnChainIDError):
+        strict = constants.net.AUXPOW_STRICT_CHAIN_ID
+        constants.net.AUXPOW_STRICT_CHAIN_ID = True
+        try:
+            with self.assertRaises(auxpow.AuxPoWOwnChainIDError):
+                blockchain.Blockchain.verify_header(header, namecoin_prev_hash_37174, namecoin_target_37174)
+        finally:
+            constants.net.AUXPOW_STRICT_CHAIN_ID = strict
+
+        # Without fStrictChainId the chain ID is no reason to reject; this
+        # parent header then fails the coinbase merkle check instead.
+        with self.assertRaises(auxpow.AuxPoWBadCoinbaseMerkleBranchError):
+            blockchain.Blockchain.verify_header(header, namecoin_prev_hash_37174, namecoin_target_37174)
+
+    # Doichain Core rejects an AuxPoW whose parent block claims to be merge-mined itself.
+    def test_should_reject_parent_with_auxpow_version(self):
+        header = self.deserialize_with_auxpow(namecoin_header_37174)
+        header['auxpow']['parent_header']['version'] |= auxpow.BLOCK_VERSION_AUXPOW_BIT
+
+        with self.assertRaises(auxpow.AuxPoWParentHasAuxPoWVersionError):
             blockchain.Blockchain.verify_header(header, namecoin_prev_hash_37174, namecoin_target_37174)
 
     # Check that where the chain merkle branch is far too long to use, it's
