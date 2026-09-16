@@ -3,7 +3,6 @@
 # file LICENCE or http://www.opensource.org/licenses/mit-license.php
 
 import asyncio
-import base64
 from distutils.version import StrictVersion
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -11,8 +10,6 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLabel, QProgressBar,
                              QHBoxLayout, QPushButton, QDialog)
 
 from electrum import version
-from electrum import constants
-from electrum import ecc
 from electrum.i18n import _
 from electrum.util import make_aiohttp_session
 from electrum.logging import Logger
@@ -20,17 +17,29 @@ from electrum.network import Network
 
 
 class UpdateCheck(QDialog, Logger):
-    url = "https://electrum.org/version"
-    download_url = "https://electrum.org/#download"
+    # Electrum-DOI is released on GitHub, so that is where the version check has
+    # to look. Inheriting upstream's electrum.org endpoints was not merely wrong
+    # but harmful: https://electrum.org/version is a genuine, correctly signed
+    # announcement -- of the Bitcoin Electrum version. It verified, it compared
+    # greater than every Electrum-DOI version, and the wallet then offered
+    # "Update to Electrum-DOI 4.6.x is available", linking to the download page
+    # of a different wallet.
+    #
+    # Upstream signs that announcement so a compromised electrum.org cannot make
+    # installed wallets advertise an update. The check is dropped here rather
+    # than reproduced with a Doichain key, because announcement and binaries
+    # would both come from GitHub: one origin, so a signature verified against a
+    # key shipped in the same repository buys little. Getting the property back
+    # needs a signing key kept outside GitHub -- tracked separately.
+    url = "https://api.github.com/repos/Doichain/electrum-doi/releases/latest"
+    download_url = "https://github.com/Doichain/electrum-doi/releases/latest"
 
-    VERSION_ANNOUNCEMENT_SIGNING_KEYS = (
-        "13xjmVAB1EATPP8RshTE8S8sNwwSUM9p1P",  # ThomasV (since 3.3.4)
-        "1Nxgk6NTooV4qZsX5fdqQwrLjYcsQZAfTg",  # ghost43 (since 4.1.2)
-    )
+    # Release tags read dc4.1.6, dc4.1.5, ...; the version is the tag without it.
+    TAG_PREFIX = "dc"
 
     def __init__(self, *, latest_version=None):
         QDialog.__init__(self)
-        self.setWindowTitle('Electrum - ' + _('Update Check'))
+        self.setWindowTitle('Electrum-DOI - ' + _('Update Check'))
         self.content = QVBoxLayout()
         self.content.setContentsMargins(*[10]*4)
 
@@ -88,10 +97,10 @@ class UpdateCheck(QDialog, Logger):
                 self.detail_label.setText(_("You can download the new version from {}.").format(url))
             else:
                 self.heading_label.setText('<h2>' + _("Already up to date") + '</h2>')
-                self.detail_label.setText(_("You are already on the latest version of Electrum."))
+                self.detail_label.setText(_("You are already on the latest version of Electrum-DOI."))
         else:
             self.heading_label.setText('<h2>' + _("Checking for updates...") + '</h2>')
-            self.detail_label.setText(_("Please wait while Electrum checks for available updates."))
+            self.detail_label.setText(_("Please wait while Electrum-DOI checks for available updates."))
 
 
 class UpdateCheckThread(QThread, Logger):
@@ -107,28 +116,19 @@ class UpdateCheckThread(QThread, Logger):
         # note: Use long timeout here as it is not critical that we get a response fast,
         #       and it's bad not to get an update notification just because we did not wait enough.
         async with make_aiohttp_session(proxy=self.network.proxy, timeout=120) as session:
-            async with session.get(UpdateCheck.url) as result:
-                signed_version_dict = await result.json(content_type=None)
-                # example signed_version_dict:
-                # {
-                #     "version": "3.9.9",
-                #     "signatures": {
-                #         "1Lqm1HphuhxKZQEawzPse8gJtgjm9kUKT4": "IA+2QG3xPRn4HAIFdpu9eeaCYC7S5wS/sDxn54LJx6BdUTBpse3ibtfq8C43M7M1VfpGkD5tsdwl5C6IfpZD/gQ="
-                #     }
-                # }
-                version_num = signed_version_dict['version']
-                sigs = signed_version_dict['signatures']
-                for address, sig in sigs.items():
-                    if address not in UpdateCheck.VERSION_ANNOUNCEMENT_SIGNING_KEYS:
-                        continue
-                    sig = base64.b64decode(sig)
-                    msg = version_num.encode('utf-8')
-                    if ecc.verify_message_with_address(address=address, sig65=sig, message=msg,
-                                                       net=constants.BitcoinMainnet):
-                        self.logger.info(f"valid sig for version announcement '{version_num}' from address '{address}'")
-                        break
-                else:
-                    raise Exception('no valid signature for version announcement')
+            headers = {'Accept': 'application/vnd.github+json'}
+            async with session.get(UpdateCheck.url, headers=headers) as result:
+                release = await result.json(content_type=None)
+                # GitHub's "latest" already excludes drafts and prereleases, so
+                # whatever it names is published and has downloadable assets.
+                tag_name = release['tag_name']
+                self.logger.info(f"latest release on GitHub is tagged '{tag_name}'")
+                version_num = tag_name
+                if version_num.startswith(UpdateCheck.TAG_PREFIX):
+                    version_num = version_num[len(UpdateCheck.TAG_PREFIX):]
+                # StrictVersion takes two or three components and raises on a
+                # fourth, which the old dc4.1.4.3 tags had. A tag that does not
+                # parse surfaces as a failed check, not as a bogus update prompt.
                 return StrictVersion(version_num.strip())
 
     def run(self):
