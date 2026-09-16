@@ -768,9 +768,12 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
         help_menu = menubar.addMenu(_("&Help"))
         help_menu.addAction(_("&About"), self.show_about)
         help_menu.addAction(_("&Check for updates"), self.show_update_check)
-        help_menu.addAction(_("&Official website"), lambda: webopen("https://electrum.org"))
+        # These pointed at electrum.org and docs.electrum.org, i.e. at a different
+        # wallet for a different chain. See update_checker.py for the same problem
+        # in the version check, where it mattered rather more.
+        help_menu.addAction(_("&Official website"), lambda: webopen("https://doichain.org"))
         help_menu.addSeparator()
-        help_menu.addAction(_("&Documentation"), lambda: webopen("http://docs.electrum.org/")).setShortcut(QKeySequence.HelpContents)
+        help_menu.addAction(_("&Documentation"), lambda: webopen("https://github.com/Doichain/electrum-doi#readme")).setShortcut(QKeySequence.HelpContents)
         if not constants.net.TESTNET:
             help_menu.addAction(_("&Bitcoin Paper"), self.show_bitcoin_paper)
         help_menu.addAction(_("&Report Bug"), self.show_report_bug)
