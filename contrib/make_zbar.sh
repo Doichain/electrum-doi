@@ -4,13 +4,20 @@
 # sudo apt-get install pkg-config libx11-dev libx11-6 libv4l-dev libxv-dev libxext-dev libjpeg-dev
 #
 # It can also be used to cross-compile to Windows:
-# $ sudo apt-get install mingw-w64 mingw-w64-tools win-iconv-mingw-w64-dev
+# $ sudo apt-get install mingw-w64 mingw-w64-tools
+# plus win-iconv for the target. Debian has no package for it; the Windows build
+# image (contrib/build-wine/Dockerfile) builds it from source into the mingw
+# sysroots. On Ubuntu it was win-iconv-mingw-w64-dev.
 # For a Windows x86 (32-bit) target, run:
 # $ GCC_TRIPLET_HOST="i686-w64-mingw32" BUILD_TYPE="wine" ./contrib/make_zbar.sh
 # Or for a Windows x86_64 (64-bit) target, run:
 # $ GCC_TRIPLET_HOST="x86_64-w64-mingw32" BUILD_TYPE="wine" ./contrib/make_zbar.sh
 
-ZBAR_VERSION="d2893738411be897a04caa42ffc13d1f6107d3c6"
+# Bumped to the commit upstream Electrum pins, for four years of fixes. Note this
+# was NOT what broke the Windows build: the missing DLL came from libtool's
+# deplibs check rejecting the static win-iconv, see lt_cv_deplibs_check_method
+# below. Both zbar commits behave the same once that is set.
+ZBAR_VERSION="bb05ec54eec57f8397cb13fb9161372a281a1219"
 
 set -e
 
@@ -47,7 +54,20 @@ info "Building $pkgname..."
     if ! [ -r config.status ] ; then
         if [ "$BUILD_TYPE" = "wine" ] ; then
             # windows target
+            # WINICONV_CONST: win-iconv declares iconv()'s second argument as
+            # `const char **` unless this is defined empty, while zbar passes a
+            # plain `char **`. Older compilers warned; gcc 14 rejects it, so
+            # qrcode/qrdectxt.c fails to build without this.
+            #
+            # lt_cv_deplibs_check_method: win-iconv is a static archive here, and
+            # libtool's file-magic test for it fails ("none of the candidates
+            # passed a file format test"). It then quietly builds a static
+            # library only -- libzbar.la ends up with dlname='' and the build
+            # later strips a directory instead of a DLL. pass_all skips that
+            # inspection, which is the usual setting for mingw cross builds.
+            CFLAGS="${CFLAGS:-} -DWINICONV_CONST=" \
             ./configure \
+                lt_cv_deplibs_check_method=pass_all \
                 $AUTOCONF_FLAGS \
                 --prefix="$here/$pkgname/dist" \
                 --with-x=no \

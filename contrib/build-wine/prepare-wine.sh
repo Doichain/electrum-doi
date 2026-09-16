@@ -134,12 +134,22 @@ info "Building PyInstaller."
                               -Wno-error=unused-value \
                               -Wno-error=implicit-function-declaration \
                               -Wno-error=int-to-pointer-cast \
-                              -Wno-error=stringop-truncation"
+                              -Wno-error=stringop-truncation \
+                              -Wno-error=maybe-uninitialized"
+    # ^ maybe-uninitialized: gcc 14 flags five spots in pyinstaller 4.2's
+    #   bootloader (pyi_utils.c and friends) that older compilers let pass, and
+    #   the waf build turns warnings into errors.
     popd
     # sanity check bootloader is there:
     [[ -e "PyInstaller/bootloader/Windows-$PYINST_ARCH/runw.exe" ]] || fail "Could not find runw.exe in target dir!"
 ) || fail "PyInstaller build failed"
 info "Installing PyInstaller."
-$WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location ./pyinstaller
+# --no-build-isolation: with isolation, pip builds this in a fresh env and pulls
+# the *newest* setuptools from PyPI, which cannot read pyinstaller 4.2's setup.py
+# any more -- it imports the repo's PyInstaller.py stub and then fails with
+# "No module named 'PyInstaller.__main__'; 'PyInstaller' is not a package".
+# Without isolation it uses the pinned setuptools 46.4.0 from
+# requirements-build-wine.txt, which is what this pyinstaller expects.
+$WINE_PYTHON -m pip install --no-dependencies --no-build-isolation --no-warn-script-location ./pyinstaller
 
 info "Wine is configured."
