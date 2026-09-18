@@ -39,6 +39,12 @@ CCY_PRECISIONS = {'BHD': 3, 'BIF': 0, 'BYR': 0, 'CLF': 4, 'CLP': 0,
 
 class ExchangeBase(Logger):
 
+    # True only on sources that quote *this* chain. Everything inherited from
+    # Electrum prices Bitcoin, and a DOI balance shown at the Bitcoin price is
+    # wrong by about six orders of magnitude with nothing on screen to say so.
+    # Such a source must never be offered, however healthy its API is. See #24.
+    quotes_doi = False
+
     def __init__(self, on_quotes, on_history):
         Logger.__init__(self)
         self.history = {}
@@ -78,7 +84,16 @@ class ExchangeBase(Logger):
     async def update_safe(self, ccy):
         try:
             self.logger.info(f"getting fx quotes for {ccy}")
-            self.quotes = await self.get_rates(ccy)
+            quotes = await self.get_rates(ccy)
+            # Every caller treats self.quotes as a mapping. A subclass that
+            # returned a bare price instead put a float -- or, when the request
+            # failed, an empty dict -- where a rate was expected, and the wallet
+            # answered with a TypeError dialog for every amount it tried to
+            # render. See #16.
+            if not isinstance(quotes, dict):
+                raise TypeError(f"{self.name()}.get_rates returned "
+                                f"{type(quotes).__name__}, expected a dict of {{ccy: Decimal}}")
+            self.quotes = quotes
             self.logger.info("received fx quotes")
         except asyncio.CancelledError:
             # CancelledError must be passed-through for cancellation to work
@@ -145,7 +160,12 @@ class ExchangeBase(Logger):
     async def request_history(self, ccy):
         raise NotImplementedError()  # implemented by subclasses
 
-    async def get_rates(self, ccy):
+    async def get_rates(self, ccy) -> dict:
+        """Returns {currency code: Decimal rate}, possibly empty.
+
+        Implemented by subclasses. The mapping is the contract: callers look
+        the selected currency up in it and treat a miss as "no rate".
+        """
         raise NotImplementedError()  # implemented by subclasses
 
     async def get_currencies(self):
@@ -304,45 +324,40 @@ class CoinDesk(ExchangeBase):
 
 
 class CoinPaprika(ExchangeBase):
+    # Doichain is not listed on CoinGecko, so this is the only source there is.
+    # It used to be read through the OHLCV endpoints, which cost us both of the
+    # other fiat defects: /ohlcv/latest takes quote=usd and answers anything
+    # else with 400 "invalid parameters" (#17), and /ohlcv/historical answers
+    # every range with 402 "not allowed in this plan" (#18). /v1/tickers has
+    # neither limitation for spot prices: 43 quote currencies on the free plan,
+    # up to three per request.
+    quotes_doi = True
+    COIN_ID = 'doi-doichain'
+    # 40 fiats from /v1/fiats plus the three crypto quotes the endpoint accepts.
+    # Anything else -- and the old list offered fourteen such, AED and XAU among
+    # them -- comes back without a price.
+    CRYPTO_QUOTES = ['BTC', 'ETH', 'BNB']
 
     async def get_rates(self, ccy):
-        # Get latest exchange rate if available
-        exchangeRate = ''
-  
-        json = await self.get_json('api.coinpaprika.com','/v1/coins/doi-doicoin/ohlcv/latest?quote=usd')
-        if len(json) != 0:
-            for pair in json:
-                for key in pair.keys():
-                    if key =='close': exchangeRate = pair[key]
-            print('exchangeRate ', exchangeRate)
-        else:
-            print('No current data available')
-            json = await self.get_json('api.coinpaprika.com', '/v1/coins/doi-doicoin/ohlcv/historical?start=2021-12-19&quote=usd')  
-            for pair in json:
-                for key in pair.keys():
-                    if key =='close': exchangeRate = pair[key]
-            print('exchangeRate ', exchangeRate)
-        return exchangeRate
+        # the wallet asks for the one currency it displays; '' means "whatever
+        # you have", which is how get_currencies() probes an exchange.
+        ccy = (ccy or DEFAULT_CURRENCY).upper()
+        json = await self.get_json(
+            'api.coinpaprika.com', f'/v1/tickers/{self.COIN_ID}?quotes={ccy}')
+        quotes = json.get('quotes') or {}
+        return {code: Decimal(str(q['price']))
+                for code, q in quotes.items() if q.get('price') is not None}
+
+    async def get_currencies(self):
+        fiats = await self.get_json('api.coinpaprika.com', '/v1/fiats')
+        return sorted({f['symbol'] for f in fiats if len(f.get('symbol', '')) == 3}
+                      | set(self.CRYPTO_QUOTES))
 
     def history_ccys(self):
-        # CoinGecko seems to have historical data for all ccys it supports
-        return CURRENCIES[self.name()]
-
-    async def request_history(self, ccy):
-        today = datetime.today().strftime("%Y-%m-%d")
-
-        historicRate = ''
-        time_close = ''                               
-        history = {}
-                        
-        res = await self.get_json('api.coinpaprika.com', f'/v1/coins/doi-doicoin/ohlcv/historical?start=2021-03-18&end={today}&quote=usd')  
-        for pair in res:
-            for key in pair.keys():
-                if key =='close': historicRate = pair[key]
-                if key =='time_close': time_close = pair[key]
-            history[time_close.split("T")[0]] = historicRate
-
-        return history
+        # None. The free plan refuses every historical range with HTTP 402,
+        # so claiming history here only bought an empty column and a failed
+        # request each time "Show history rates" was on. See #18.
+        return []
 
 
 class CointraderMonitor(ExchangeBase):
@@ -461,9 +476,13 @@ def get_exchanges_and_currencies():
     # or if not present, generate it now.
     print("cannot find currencies.json. will regenerate it now.")
     d = {}
+    # quotes_doi filters out the inherited Bitcoin sources: currencies.json is
+    # what the Source dropdown is built from, so anything listed here is
+    # offered to the user. See #24.
     is_exchange = lambda obj: (inspect.isclass(obj)
                                and issubclass(obj, ExchangeBase)
-                               and obj != ExchangeBase)
+                               and obj != ExchangeBase
+                               and obj.quotes_doi)
     exchanges = dict(inspect.getmembers(sys.modules[__name__], is_exchange))
 
     async def get_currencies_safe(name, exchange):
@@ -594,8 +613,21 @@ class FxThread(ThreadJob):
         '''Use when dynamic fetching is needed'''
         return self.config.get("currency", DEFAULT_CURRENCY)
 
+    @staticmethod
+    def _exchange_class(name):
+        """The class for an exchange name, or None if it does not quote DOI."""
+        class_ = globals().get(name)
+        if (inspect.isclass(class_) and issubclass(class_, ExchangeBase)
+                and class_.quotes_doi):
+            return class_
+        return None
+
     def config_exchange(self):
-        return self.config.get('use_exchange', DEFAULT_EXCHANGE)
+        name = self.config.get('use_exchange', DEFAULT_EXCHANGE)
+        # A wallet configured before the Bitcoin-only sources were withdrawn
+        # carries one of them in its config and would otherwise keep valuing
+        # DOI at the Bitcoin price. See #24.
+        return name if self._exchange_class(name) else DEFAULT_EXCHANGE
 
     def show_history(self):
         return self.is_enabled() and self.get_history_config() and self.ccy in self.exchange.history_ccys()
@@ -611,7 +643,12 @@ class FxThread(ThreadJob):
             self.network.asyncio_loop.call_soon_threadsafe(self._trigger.set)
 
     def set_exchange(self, name):
-        class_ = globals().get(name) or globals().get(DEFAULT_EXCHANGE)
+        class_ = self._exchange_class(name)
+        if class_ is None:
+            self.logger.info(f"exchange {name} does not quote DOI, "
+                             f"falling back to {DEFAULT_EXCHANGE}")
+            name = DEFAULT_EXCHANGE
+            class_ = self._exchange_class(name)
         self.logger.info(f"using exchange {name}")
         if self.config_exchange() != name:
             self.config.set_key('use_exchange', name, True)
@@ -632,7 +669,7 @@ class FxThread(ThreadJob):
         """Returns the exchange rate as a Decimal"""
         if not self.is_enabled():
             return Decimal('NaN')
-        rate = self.exchange.quotes
+        rate = self.exchange.quotes.get(self.ccy)
         if rate is None:
             return Decimal('NaN')
         return Decimal(rate)
@@ -674,7 +711,7 @@ class FxThread(ThreadJob):
         # Frequently there is no rate for today, until tomorrow :)
         # Use spot quotes in that case
         if rate in ('NaN', None) and (datetime.today().date() - d_t.date()).days <= 2:
-            rate = self.exchange.quotes
+            rate = self.exchange.quotes.get(self.ccy)
             self.history_used_spot = True
         if rate is None:
             rate = 'NaN'
