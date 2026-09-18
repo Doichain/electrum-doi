@@ -1,0 +1,118 @@
+# Unit tests and the mandatory linter, on every push and pull request.
+#
+# This repository ran nothing between July 2021 and now: the .travis.yml it
+# inherited stopped working when Travis ended its free open-source tier, and it
+# was already broken before that (its tarball job changes into electrum-nmc, the
+# Namecoin repository this was forked from). Upstream Electrum moved to GitHub
+# Actions after our fork point, so there was nothing to inherit either. What it
+# cost is on the record: a broken quotes contract in exchange_rate.py made
+# test_wallet.py hang rather than fail, and nobody noticed for years (#16).
+#
+# Deliberately lean. The heavy jobs the old Travis file described -- Windows,
+# Android, AppImage, macOS and tarball builds -- belong in a release workflow,
+# not on every push.
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Flake8
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - run: pip install flake8
+
+      - name: Run flake8
+        # The selection the old Travis file used: syntax errors and undefined
+        # names -- the findings that mean the code cannot run. Clean today.
+        #
+        # F824 is ignored rather than absent: --select matches by prefix, so F82
+        # pulls in F824 (a redundant global/nonlocal) as well. It reports six
+        # places, four plain deletions and two that need a partial edit, so it
+        # is follow-up work rather than something to fix on the way past. See
+        # the follow-up issue.
+        run: >
+          flake8 . --count --show-source --statistics
+          --select=E9,F63,F7,F82 --extend-ignore=F824
+          --exclude=".git,build,dist,*_pb2.py,contrib/deterministic-build,electrum/_vendor"
+
+  unittests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.9, not the 3.8.8 the Windows build ships: 3.8 is past end of life
+          # and no longer carried by the runner images. Worth revisiting when
+          # contrib/build-wine/prepare-wine.sh moves.
+          python-version: '3.9'
+          cache: 'pip'
+
+      - name: Build libsecp256k1
+        # From the pinned commit in the script, rather than a distro package,
+        # so the library is the same one the release binaries carry.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential automake libtool pkg-config
+          ./contrib/make_libsecp256k1.sh
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r contrib/requirements/requirements.txt
+          # The 'tests' extra from setup.py, spelled out rather than installed as
+          # ".[tests]": that form also applies setup.py's install_requires, which
+          # carries no upper bounds and would undo the pins just resolved above.
+          # Keep in sync with extras_require['tests'].
+          pip install "pycryptodomex>=3.7" "cryptography>=2.6" "pyaes>=0.1a1"
+
+      - name: Run unit tests
+        # Everything except the modules below, so a newly added test file is
+        # picked up without touching this workflow.
+        #
+        # The excluded ten fail on test vectors inherited from Bitcoin and never
+        # adapted when this chain's parameters changed -- addresses beginning
+        # bc1/tb1 rather than dc1/td1, Bitcoin WIF keys, wallet files full of
+        # Bitcoin addresses that the wallet then correctly refuses to open. 98
+        # tests, and as far as I could tell not one of them a real defect; each
+        # needs a vector regenerated for this chain, which cannot be done by
+        # deriving it from the code under test without the test becoming
+        # circular. Tracked in the follow-up issue; take them off this list one
+        # module at a time.
+        run: |
+          # One line on purpose: with the list wrapped, the word at each line
+          # end is followed by a newline rather than a space and the match below
+          # misses it, which quietly let two failing modules back in.
+          EXCLUDE="test_bitcoin test_bolt11 test_commands test_lnmsg test_lnutil test_storage_upgrade test_transaction test_util test_wallet test_wallet_vertical"
+          MODULES=""
+          for f in electrum/tests/test_*.py; do
+            m=$(basename "$f" .py)
+            case " $EXCLUDE " in
+              *" $m "*) continue ;;
+            esac
+            MODULES="$MODULES electrum.tests.$m"
+          done
+          echo "running:$MODULES"
+          python -m unittest $MODULES

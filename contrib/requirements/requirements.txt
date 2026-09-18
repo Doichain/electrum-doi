@@ -1,5 +1,9 @@
 qrcode
-protobuf>=3.12
+# Upper bound matters: protobuf 3.21 rewrote the runtime and refuses the
+# _pb2.py files generated here, so an install without it imports but
+# cannot parse a payment request. Regenerating them with protoc >= 3.19
+# would lift this.
+protobuf>=3.12,<3.21
 qdarkstyle<2.9
 aiorpcx>=0.18.7,<0.19
 aiohttp>=3.3.0,<4.0.0
