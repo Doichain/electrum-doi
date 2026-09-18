@@ -57,7 +57,8 @@ from .util import (NotEnoughFunds, UserCancelled, profiler,
                    WalletFileException, BitcoinException, MultipleSpendMaxTxOutputs,
                    InvalidPassword, format_time, timestamp_to_datetime, Satoshis,
                    Fiat, bfh, bh2u, TxMinedInfo, quantize_feerate, create_bip21_uri, OrderedDictWithIndex)
-from .simple_config import SimpleConfig, FEE_RATIO_HIGH_WARNING, FEERATE_WARNING_HIGH_FEE
+from .simple_config import (SimpleConfig, FEE_RATIO_HIGH_WARNING, FEERATE_WARNING_HIGH_FEE,
+                            FEERATE_MIN_MINEABLE)
 from .bitcoin import COIN, TYPE_ADDRESS
 from .bitcoin import is_address, address_to_script, is_minikey, relayfee, dust_threshold
 from .crypto import sha256d
@@ -2579,6 +2580,17 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
                     _("This transaction requires a higher fee, or it will not be propagated by your current server.") + " "
                     + _("Try to raise your transaction fee, or use a server with a lower relay fee."))
             short_warning = _("below relay fee") + "!"
+            allow_send = False
+        elif feerate < FEERATE_MIN_MINEABLE / 1000:
+            # The servers this wallet talks to run with a lowered relay limit, so
+            # they take such a transaction and it shows as sent -- but the mining
+            # node keeps Doichain's default of 100 sat/byte and will never put it
+            # in a block. Saying so beats letting it hang forever.
+            long_warning = (
+                    _("This transaction pays less than Doichain's minimum fee, so it would be "
+                      "relayed but never mined.") + " "
+                    + _("Raise the fee to at least {} sat/byte.").format(FEERATE_MIN_MINEABLE // 1000))
+            short_warning = _("below the network minimum") + "!"
             allow_send = False
         elif fee_ratio >= FEE_RATIO_HIGH_WARNING:
             long_warning = (
