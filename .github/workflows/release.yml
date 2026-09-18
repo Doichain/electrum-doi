@@ -60,11 +60,20 @@ jobs:
         run: docker build -t electrum-wine-builder-img ./contrib/build-wine/
 
       - name: Build
+        # GIT_CONFIG_*: the checkout belongs to the runner user, the container
+        # runs as root, so git refuses the working tree as "dubious ownership"
+        # -- and build-electrum-git.sh takes the version from `git describe`,
+        # so the build stops right there. Set through the environment rather
+        # than by writing into the image or the tree, so nothing about the
+        # build itself changes.
         run: |
           docker run --rm \
             -v "$PWD":/opt/wine64/drive_c/electrum-doi \
             --workdir /opt/wine64/drive_c/electrum-doi/contrib/build-wine \
             -e WIN_ARCH=${{ matrix.arch }} \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/opt/wine64/drive_c/electrum-doi \
             electrum-wine-builder-img ./build.sh
 
       - name: Checksums
