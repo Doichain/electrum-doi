@@ -350,6 +350,28 @@ def _get_cert_path_for_host(*, config: 'SimpleConfig', host: str) -> str:
     return os.path.join(config.path, 'certs', filename)
 
 
+def bucket_of_ip_address(addr: Optional[str]) -> str:
+    """The group the network layer allows at most one connection from.
+
+    A /16 for IPv4, a /48 for IPv6 -- roughly "one operator's network". Pulled
+    out of Interface so the bundled server list can be checked against it
+    without standing up an interface. See #22.
+    """
+    try:
+        ip_addr = ip_address(addr)  # type: Union[IPv4Address, IPv6Address]
+    except ValueError:
+        return ''
+    if not ip_addr:
+        return ''
+    if ip_addr.is_loopback:  # localhost is exempt
+        return ''
+    if ip_addr.version == 4:
+        return str(IPv4Network(ip_addr).supernet(prefixlen_diff=32-16))
+    elif ip_addr.version == 6:
+        return str(IPv6Network(ip_addr).supernet(prefixlen_diff=128-48))
+    return ''
+
+
 class Interface(Logger):
 
     LOGGING_SHORTCUT = 'i'
@@ -908,21 +930,7 @@ class Interface(Logger):
         def do_bucket():
             if self.is_tor():
                 return BUCKET_NAME_OF_ONION_SERVERS
-            try:
-                ip_addr = ip_address(self.ip_addr())  # type: Union[IPv4Address, IPv6Address]
-            except ValueError:
-                return ''
-            if not ip_addr:
-                return ''
-            if ip_addr.is_loopback:  # localhost is exempt
-                return ''
-            if ip_addr.version == 4:
-                slash16 = IPv4Network(ip_addr).supernet(prefixlen_diff=32-16)
-                return str(slash16)
-            elif ip_addr.version == 6:
-                slash48 = IPv6Network(ip_addr).supernet(prefixlen_diff=128-48)
-                return str(slash48)
-            return ''
+            return bucket_of_ip_address(self.ip_addr())
 
         if not self._ipaddr_bucket:
             self._ipaddr_bucket = do_bucket()
