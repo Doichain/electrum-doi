@@ -7,12 +7,15 @@ import socket
 import concurrent
 from concurrent import futures
 import ipaddress
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import dns
 import dns.resolver
 
 from .logging import get_logger
+
+if TYPE_CHECKING:
+    from .simple_config import SimpleConfig
 
 
 _logger = get_logger(__name__)
@@ -20,7 +23,21 @@ _logger = get_logger(__name__)
 _dns_threads_executor = None  # type: Optional[concurrent.futures.Executor]
 
 
-def configure_dns_depending_on_proxy(is_proxy: bool) -> None:
+def use_windows_dns_hack(config: Optional['SimpleConfig']) -> bool:
+    """Whether to resolve DNS ourselves on Windows instead of asking the OS.
+
+    On by default. Setting 'windows_dns_hack' to false in the config hands
+    resolution back to the system, which is the way out for a machine whose
+    registry offers the wrong resolvers -- see #19 and the note in
+    _prepare_windows_dns_hack.
+    """
+    if config is None:
+        return True
+    return bool(config.get('windows_dns_hack', True))
+
+
+def configure_dns_depending_on_proxy(is_proxy: bool, *,
+                                     config: Optional['SimpleConfig'] = None) -> None:
     # Store this somewhere so we can un-monkey-patch:
     if not hasattr(socket, "_getaddrinfo"):
         socket._getaddrinfo = socket.getaddrinfo
@@ -28,7 +45,7 @@ def configure_dns_depending_on_proxy(is_proxy: bool) -> None:
         # prevent dns leaks, see http://stackoverflow.com/questions/13184205/dns-over-proxy
         socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
     else:
-        if sys.platform == 'win32':
+        if sys.platform == 'win32' and use_windows_dns_hack(config):
             # On Windows, socket.getaddrinfo takes a mutex, and might hold it for up to 10 seconds
             # when dns-resolving. To speed it up drastically, we resolve dns ourselves, outside that lock.
             # See https://github.com/spesmilo/electrum/issues/4421
@@ -39,12 +56,26 @@ def configure_dns_depending_on_proxy(is_proxy: bool) -> None:
             else:
                 socket.getaddrinfo = _fast_getaddrinfo
         else:
+            if sys.platform == 'win32':
+                _logger.info('windows dns hack switched off in the config; '
+                             'resolving through the system instead')
             socket.getaddrinfo = socket._getaddrinfo
 
 
 def _prepare_windows_dns_hack():
     # enable dns cache
     resolver = dns.resolver.get_default_resolver()
+    # Which resolvers these are belongs in the log. dnspython reads them from
+    # the registry, where Windows keeps an entry for *every* adapter the
+    # machine has ever had -- and the version we pin skips only adapters that
+    # are disabled, not ones that are merely disconnected. A long-dead adapter
+    # can therefore put a stranger's resolver at the top of this list while
+    # every other program on the machine uses the right one, and the only
+    # visible symptom is the wallet connecting to addresses nothing else
+    # resolves. That is #19; it cost an afternoon of netstat to find, and one
+    # line in the log would have answered it. Set windows_dns_hack to false in
+    # the config to resolve through the system instead.
+    _logger.info(f"windows dns hack: resolving through {resolver.nameservers}")
     if resolver.cache is None:
         resolver.cache = dns.resolver.Cache()
     # ensure overall timeout for requests is long enough
