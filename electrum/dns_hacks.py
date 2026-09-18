@@ -7,20 +7,55 @@ import socket
 import concurrent
 from concurrent import futures
 import ipaddress
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import dns
 import dns.resolver
 
 from .logging import get_logger
 
+if TYPE_CHECKING:
+    from .simple_config import SimpleConfig
+
 
 _logger = get_logger(__name__)
+
+# Whether to resolve DNS ourselves on Windows rather than asking the system.
+# Off -- see use_windows_dns_hack.
+DEFAULT_WINDOWS_DNS_HACK = False
 
 _dns_threads_executor = None  # type: Optional[concurrent.futures.Executor]
 
 
-def configure_dns_depending_on_proxy(is_proxy: bool) -> None:
+def use_windows_dns_hack(config: Optional['SimpleConfig']) -> bool:
+    """Whether to resolve DNS ourselves on Windows instead of asking the system.
+
+    Off, deliberately. Doing it ourselves is a speed optimisation, and it buys
+    that speed with the wrong resolvers: dnspython reads Windows' DNS servers
+    out of the registry, which keeps an entry for every adapter the machine has
+    ever had, and the version pinned here skips only adapters that are
+    *disabled*, not ones that are merely disconnected. A long-dead adapter's
+    resolver then answers for the wallet while every other program on the
+    machine uses the right one. Found in the field: the wallet connected to an
+    address nothing else on the machine resolved. See #19.
+
+    What the optimisation buys scales with the number of names resolved, and
+    ours is five: four servers from servers.json plus the rate API, all of them
+    cached by Windows after the first lookup. Upstream ships 71 servers and
+    discovers more, which is the situation it was written for
+    (spesmilo/electrum#4421). Five names are not worth resolving through a
+    resolver we did not choose -- especially as four of them are the servers
+    the wallet takes its chain data from.
+
+    Set 'windows_dns_hack' to true in the config to switch it back on.
+    """
+    if config is None:
+        return DEFAULT_WINDOWS_DNS_HACK
+    return bool(config.get('windows_dns_hack', DEFAULT_WINDOWS_DNS_HACK))
+
+
+def configure_dns_depending_on_proxy(is_proxy: bool, *,
+                                     config: Optional['SimpleConfig'] = None) -> None:
     # Store this somewhere so we can un-monkey-patch:
     if not hasattr(socket, "_getaddrinfo"):
         socket._getaddrinfo = socket.getaddrinfo
@@ -28,7 +63,7 @@ def configure_dns_depending_on_proxy(is_proxy: bool) -> None:
         # prevent dns leaks, see http://stackoverflow.com/questions/13184205/dns-over-proxy
         socket.getaddrinfo = lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
     else:
-        if sys.platform == 'win32':
+        if sys.platform == 'win32' and use_windows_dns_hack(config):
             # On Windows, socket.getaddrinfo takes a mutex, and might hold it for up to 10 seconds
             # when dns-resolving. To speed it up drastically, we resolve dns ourselves, outside that lock.
             # See https://github.com/spesmilo/electrum/issues/4421
@@ -39,12 +74,24 @@ def configure_dns_depending_on_proxy(is_proxy: bool) -> None:
             else:
                 socket.getaddrinfo = _fast_getaddrinfo
         else:
+            if sys.platform == 'win32':
+                # The system resolver uses the adapters that are actually
+                # connected. It serialises, because CPython takes a process-wide
+                # lock around getaddrinfo on Windows (socketmodule.c defines
+                # USE_GETADDRINFO_LOCK whenever HAVE_GETADDRINFO is absent, and
+                # PC/pyconfig.h never defines it) -- which is what the hack above
+                # exists to avoid, and what five cached names make affordable.
+                _logger.info("resolving through the system resolver; "
+                             "set windows_dns_hack to true to use dnspython instead")
             socket.getaddrinfo = socket._getaddrinfo
 
 
 def _prepare_windows_dns_hack():
     # enable dns cache
     resolver = dns.resolver.get_default_resolver()
+    # Whoever switched this on should be able to see what they got. These come
+    # from the registry, stale adapters included -- see use_windows_dns_hack.
+    _logger.info(f"windows dns hack: resolving through {resolver.nameservers}")
     if resolver.cache is None:
         resolver.cache = dns.resolver.Cache()
     # ensure overall timeout for requests is long enough

@@ -600,7 +600,7 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
 
     def _set_proxy(self, proxy: Optional[dict]):
         self.proxy = proxy
-        dns_hacks.configure_dns_depending_on_proxy(bool(proxy))
+        dns_hacks.configure_dns_depending_on_proxy(bool(proxy), config=self.config)
         self.logger.info(f'setting proxy {proxy}')
         util.trigger_callback('proxy_set', self.proxy)
 
