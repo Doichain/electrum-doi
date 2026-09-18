@@ -81,6 +81,9 @@ jobs:
         # the whole point, and a log line needs no download.
         run: |
           cd contrib/build-wine/dist
+          # The container wrote these as root; the runner user cannot add a file
+          # beside them until it owns the directory.
+          sudo chown -R "$(id -u):$(id -g)" .
           ls -l *.exe
           sha256sum *.exe | tee SHA256SUMS
           echo "::notice title=sha256 (${{ matrix.arch }})::$(sha256sum *.exe | tr '\n' ' ')"
