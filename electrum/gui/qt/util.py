@@ -555,12 +555,17 @@ class MyTreeView(QTreeView):
 
     filter_columns: Iterable[int]
 
+    # Starting width of the stretch column, in pixels. Wide enough for a
+    # sentence of description; the user can drag it from there.
+    STRETCH_COLUMN_WIDTH = 300
+
     def __init__(self, parent: 'ElectrumWindow', create_menu, *,
                  stretch_column=None, editable_columns=None):
         super().__init__(parent)
         self.parent = parent
         self.config = self.parent.config
         self.stretch_column = stretch_column
+        self._stretch_column_sized = False
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(create_menu)
         self.setUniformRowHeights(True)
@@ -628,10 +633,29 @@ class MyTreeView(QTreeView):
             headers = dict(enumerate(headers))
         col_names = [headers[col_idx] for col_idx in sorted(headers.keys())]
         self.original_model().setHorizontalHeaderLabels(col_names)
-        self.header().setStretchLastSection(False)
-        for col_idx in headers:
-            sm = QHeaderView.Stretch if col_idx == self.stretch_column else QHeaderView.ResizeToContents
+        self.apply_column_sizing(headers)
+
+    def apply_column_sizing(self, columns: Iterable[int]) -> None:
+        """Column widths, with the stretch column left to the user.
+
+        Stretch and ResizeToContents both compute their own width, so a header
+        built purely from those two has no edge anywhere for the user to grab
+        and nothing in the list can be resized. The stretch column -- a
+        description, a label, the one column whose right width is a matter of
+        taste -- is therefore Interactive, and the last visible section absorbs
+        whatever width is left over. See #20.
+        """
+        self.header().setStretchLastSection(True)
+        for col_idx in columns:
+            sm = (QHeaderView.Interactive if col_idx == self.stretch_column
+                  else QHeaderView.ResizeToContents)
             self.header().setSectionResizeMode(col_idx, sm)
+        # Only on the way in: this runs again whenever the headers are rebuilt
+        # (the address list does it on every fiat setting change), and a width
+        # the user has dragged must survive that.
+        if self.stretch_column is not None and not self._stretch_column_sized:
+            self._stretch_column_sized = True
+            self.header().resizeSection(self.stretch_column, self.STRETCH_COLUMN_WIDTH)
 
     def keyPressEvent(self, event):
         if self.itemDelegate().opened:
