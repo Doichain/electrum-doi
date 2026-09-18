@@ -535,7 +535,12 @@ class SimpleConfig(Logger):
             return self.has_fee_etas()
 
     def is_dynfee(self):
-        return bool(self.get('dynamic_fees', True))
+        # Off by default on Doichain. Dynamic fees rest on Core's estimator, which
+        # needs a backlog of competing, fee-paying transactions to learn from;
+        # this chain's blocks are nearly empty, so every server answers
+        # blockchain.estimatefee with -1 and the slider has nothing to place.
+        # A control that cannot work should not be the default (#15).
+        return bool(self.get('dynamic_fees', False))
 
     def use_mempool_fees(self):
         return bool(self.get('mempool_fees', False))
@@ -576,6 +581,14 @@ class SimpleConfig(Logger):
                 fee_rate = self.depth_to_fee(self.get_depth_level())
             else:
                 fee_rate = self.eta_to_fee(self.get_fee_level())
+            if fee_rate is None:
+                # Doichain's blocks are nearly empty, so Core's fee estimator has
+                # nothing to learn from and every server answers
+                # blockchain.estimatefee with -1. Handing None back to the caller
+                # surfaced as a fee of ZERO in the send dialog, and the node then
+                # rejected the transaction -- see #15. The static rate is a poor
+                # estimate but a usable one.
+                fee_rate = self.get('fee_per_kb', FEERATE_FALLBACK_STATIC_FEE)
         else:
             fee_rate = self.get('fee_per_kb', FEERATE_FALLBACK_STATIC_FEE)
         if fee_rate is not None:
