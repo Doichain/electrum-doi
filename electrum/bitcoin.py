@@ -352,11 +352,25 @@ def relayfee(network: 'Network' = None) -> int:
 DUST_LIMIT_DEFAULT_SAT_LEGACY = 546
 DUST_LIMIT_DEFAULT_SAT_SEGWIT = 294
 
+# Core does not derive dust from minRelayTxFee; it has a separate dustRelayFee,
+# DUST_RELAY_TX_FEE = 3000 sat/kvB (doichain-core, src/policy/policy.h), which
+# Doichain left at Bitcoin's value while raising minRelayTxFee to 100000. The
+# old formula here (3 * the relay fee a server reports) happened to give Core's
+# answer only as long as every server reported 1000; a server reporting this
+# chain's real floor pushed the limit to a hundred times Core's. Read the
+# constant instead, and the limit is 546 sat for P2PKH and 294 for P2WPKH,
+# exactly as the node computes it.
+DUST_RELAY_TX_FEE = 3000  # sat/kvB
+
 
 def dust_threshold(network: 'Network' = None) -> int:
-    """Returns the dust limit in swartzs."""
+    """Returns the dust limit in swartzs.
+
+    The network argument is kept for call-site compatibility; the limit is a
+    consensus-adjacent policy constant and does not depend on the server.
+    """
     # Change <= dust threshold is added to the tx fee
-    dust_lim = 182 * 3 * relayfee(network)  # in msat
+    dust_lim = 182 * DUST_RELAY_TX_FEE  # in msat
     # convert to sat, but round up:
     return (dust_lim // 1000) + (dust_lim % 1000 > 0)
 
