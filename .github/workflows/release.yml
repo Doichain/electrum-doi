@@ -1,0 +1,86 @@
+# Builds the Windows binaries for a release tag -- as a second witness, not as
+# a replacement for the local build.
+#
+# The Windows build is designed to be reproducible: the builder image pins its
+# base by digest and its packages to a dated Debian snapshot, every timestamp in
+# the tree is set to 2000-11-11, and pyinstaller runs from deterministic.spec.
+# Two independent builds should therefore produce byte-identical binaries -- and
+# until now nobody had ever checked, because this project only ever built on one
+# machine.
+#
+# So this workflow uploads artifacts and prints their sha256; it deliberately
+# does NOT attach anything to the release. The binaries that ship are still the
+# locally built ones, with SHA256SUMS signed by the maintainer's key. What this
+# adds is the ability to say the hashes match.
+name: Release binaries
+
+on:
+  push:
+    tags: ['dc*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag or commit to build (e.g. dc4.1.7)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # 4.1.6 shipped win32 only; build.sh also understands win64.
+        arch: [win32]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          # git describe --tags supplies the version the binaries are named
+          # after, so the tags have to come along.
+          fetch-depth: 0
+
+      - name: Show what is being built
+        run: |
+          git describe --tags --dirty --always
+          grep ELECTRUM_VERSION electrum/version.py
+
+      - name: Free disk space
+        # The builder image is close to 5 GB and the runner starts with about
+        # 14 GB free. These are preinstalled toolchains this build never uses.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Build the builder image
+        run: docker build -t electrum-wine-builder-img ./contrib/build-wine/
+
+      - name: Build
+        run: |
+          docker run --rm \
+            -v "$PWD":/opt/wine64/drive_c/electrum-doi \
+            --workdir /opt/wine64/drive_c/electrum-doi/contrib/build-wine \
+            -e WIN_ARCH=${{ matrix.arch }} \
+            electrum-wine-builder-img ./build.sh
+
+      - name: Checksums
+        # Printed into the log on purpose: comparing against the local build is
+        # the whole point, and a log line needs no download.
+        run: |
+          cd contrib/build-wine/dist
+          ls -l *.exe
+          sha256sum *.exe | tee SHA256SUMS
+          echo "::notice title=sha256 (${{ matrix.arch }})::$(sha256sum *.exe | tr '\n' ' ')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            contrib/build-wine/dist/*.exe
+            contrib/build-wine/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
