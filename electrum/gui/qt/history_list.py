@@ -36,7 +36,7 @@ from decimal import Decimal
 from PyQt5.QtGui import QMouseEvent, QFont, QBrush, QColor
 from PyQt5.QtCore import (Qt, QPersistentModelIndex, QModelIndex, QAbstractItemModel,
                           QSortFilterProxyModel, QVariant, QItemSelectionModel, QDate, QPoint)
-from PyQt5.QtWidgets import (QMenu, QHeaderView, QLabel, QMessageBox,
+from PyQt5.QtWidgets import (QMenu, QLabel, QMessageBox,
                              QPushButton, QComboBox, QVBoxLayout, QCalendarWidget,
                              QGridLayout)
 
@@ -472,10 +472,9 @@ class HistoryList(MyTreeView, AcceptFileDragDrop):
         self.wallet = self.parent.wallet  # type: Abstract_Wallet
         self.sortByColumn(HistoryColumns.STATUS, Qt.AscendingOrder)
         self.setRootIsDecorated(True)
-        self.header().setStretchLastSection(False)
-        for col in HistoryColumns:
-            sm = QHeaderView.Stretch if col == self.stretch_column else QHeaderView.ResizeToContents
-            self.header().setSectionResizeMode(col, sm)
+        # This list builds its own header rather than going through
+        # update_headers, so it has to ask for the sizing itself.
+        self.apply_column_sizing(HistoryColumns)
 
     def update(self):
         self.hm.refresh('HistoryList.update()')
