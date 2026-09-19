@@ -77,8 +77,9 @@ jobs:
             electrum-wine-builder-img ./build.sh
 
       - name: Checksums
-        # Printed into the log on purpose: comparing against the local build is
-        # the whole point, and a log line needs no download.
+        # These exist to be compared against a local build of the same tag, so
+        # they go where someone looking for them will find them: the run's own
+        # summary page, not somewhere in 20,000 lines of wine output.
         run: |
           cd contrib/build-wine/dist
           # The container wrote these as root; the runner user cannot add a file
@@ -86,7 +87,24 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" .
           ls -l *.exe
           sha256sum *.exe | tee SHA256SUMS
-          echo "::notice title=sha256 (${{ matrix.arch }})::$(sha256sum *.exe | tr '\n' ' ')"
+
+          # git is on the runner, but an empty heading would be a silly way to
+          # find that out.
+          ref="$(git describe --tags --always 2>/dev/null || echo '${{ github.event.inputs.ref || github.ref_name }}')"
+          {
+            echo "## Windows ${{ matrix.arch }} — \`${ref:-unknown}\`"
+            echo
+            echo "| file | bytes | sha256 |"
+            echo "|---|---:|---|"
+            for f in *.exe; do
+              printf '| `%s` | %s | `%s` |\n' \
+                "$f" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            echo
+            echo "Built from a clean checkout on a runner. A local build of the"
+            echo "same tag should produce the same three hashes; if it does not,"
+            echo "something is in one tree that is not in the other."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
